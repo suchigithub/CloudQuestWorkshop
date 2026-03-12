@@ -18,3 +18,7 @@ Thumbs.db
 # Environment
 *.env
 *.env.local
+
+publish/
+deploy.zip
+az_sub.txt
