@@ -1,0 +1,74 @@
+# ==========================================================
+# GitHub Actions CI/CD Pipeline
+# Cloud Quest – Microsoft Azure Workshop
+#
+# Triggers on push to 'main' branch.
+# Builds the React SPA, publishes the .NET 8 API,
+# and deploys the combined app to Azure App Service.
+# ==========================================================
+
+name: Build and Deploy to Azure App Service
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:          # Allow manual trigger from GitHub UI
+
+env:
+  AZURE_WEBAPP_NAME: cloudquest-workshop   # ← Replace with your App Service name
+  DOTNET_VERSION: '8.0.x'
+  NODE_VERSION: '18.x'
+
+jobs:
+  build-and-deploy:
+    name: Build & Deploy
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      # ── 1. Checkout source code ──
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Setup Node.js for React build ──
+      - name: Setup Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: client/package-lock.json
+
+      # ── 3. Install dependencies & build React SPA ──
+      # Vite outputs to ../server/wwwroot (configured in vite.config.js)
+      - name: Install client dependencies
+        working-directory: client
+        run: npm ci
+
+      - name: Build React SPA
+        working-directory: client
+        run: npm run build
+
+      # ── 4. Setup .NET 8 SDK ──
+      - name: Setup .NET ${{ env.DOTNET_VERSION }}
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      # ── 5. Restore & publish .NET API ──
+      # The wwwroot folder (React build) is already inside server/
+      - name: Restore .NET dependencies
+        working-directory: server
+        run: dotnet restore
+
+      - name: Publish .NET application
+        working-directory: server
+        run: dotnet publish -c Release -o ../publish
+
+      # ── 6. Deploy to Azure App Service ──
+      - name: Deploy to Azure Web App
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: ${{ env.AZURE_WEBAPP_NAME }}
+          publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }}
+          package: publish
