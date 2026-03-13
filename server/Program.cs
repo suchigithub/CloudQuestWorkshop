@@ -9,12 +9,17 @@
 
 using System.Collections.Concurrent;
 using System.ComponentModel.DataAnnotations;
+using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Text;
 
 var builder = WebApplication.CreateBuilder(args);
 
 // --- Service Configuration ---
+
+// Application Insights telemetry (auto-detects connection string from Azure)
+builder.Services.AddApplicationInsightsTelemetry();
+
 builder.Services.AddCors(options =>
 {
     options.AddPolicy("AllowReactDev", policy =>
@@ -32,8 +37,35 @@ app.UseCors("AllowReactDev");
 app.UseDefaultFiles();
 app.UseStaticFiles();
 
-// --- In-Memory User Store (workshop demo; use a database in production) ---
+// --- In-Memory Stores ---
 var registeredUsers = new ConcurrentDictionary<string, RegisteredUser>(StringComparer.OrdinalIgnoreCase);
+var requestMetrics = new RequestMetrics();
+
+// --- Request Logging Middleware ---
+app.Use(async (context, next) =>
+{
+    var sw = Stopwatch.StartNew();
+    requestMetrics.TotalRequests++;
+
+    try
+    {
+        await next();
+        sw.Stop();
+
+        var statusCode = context.Response.StatusCode;
+        requestMetrics.TrackRequest(context.Request.Path, statusCode, sw.ElapsedMilliseconds);
+
+        if (statusCode >= 400 && statusCode < 500) requestMetrics.ClientErrors++;
+        if (statusCode >= 500) requestMetrics.ServerErrors++;
+    }
+    catch (Exception)
+    {
+        sw.Stop();
+        requestMetrics.ServerErrors++;
+        requestMetrics.TotalRequests++;
+        throw;
+    }
+});
 
 // --- API Endpoints ---
 
@@ -42,7 +74,9 @@ app.MapGet("/api/health", () => Results.Ok(new
 {
     status = "healthy",
     service = "CloudQuest Workshop API",
-    timestamp = DateTime.UtcNow
+    timestamp = DateTime.UtcNow,
+    uptime = (DateTime.UtcNow - requestMetrics.StartTime).ToString(@"d\.hh\:mm\:ss"),
+    environment = builder.Environment.EnvironmentName
 }));
 
 // Workshop details endpoint
@@ -148,9 +182,83 @@ app.MapPost("/api/login", (LoginRequest request) =>
 // SPA fallback – any unmatched route serves index.html
 app.MapFallbackToFile("index.html");
 
+// --- Monitoring Endpoints ---
+
+// Dashboard metrics for the monitoring page
+app.MapGet("/api/monitor", () => Results.Ok(new
+{
+    server = new
+    {
+        status = "healthy",
+        uptime = (DateTime.UtcNow - requestMetrics.StartTime).ToString(@"d\.hh\:mm\:ss"),
+        startTime = requestMetrics.StartTime,
+        environment = builder.Environment.EnvironmentName
+    },
+    traffic = new
+    {
+        totalRequests = requestMetrics.TotalRequests,
+        clientErrors = requestMetrics.ClientErrors,
+        serverErrors = requestMetrics.ServerErrors,
+        successRate = requestMetrics.TotalRequests > 0
+            ? Math.Round((1.0 - (double)(requestMetrics.ClientErrors + requestMetrics.ServerErrors) / requestMetrics.TotalRequests) * 100, 1)
+            : 100.0
+    },
+    registrations = new
+    {
+        totalUsers = registeredUsers.Count,
+        institutions = registeredUsers.Values
+            .GroupBy(u => u.Institution, StringComparer.OrdinalIgnoreCase)
+            .Select(g => new { name = g.Key, count = g.Count() })
+            .OrderByDescending(x => x.count)
+    },
+    recentRequests = requestMetrics.GetRecentRequests(20),
+    performance = new
+    {
+        avgResponseTimeMs = requestMetrics.GetAverageResponseTime(),
+        maxResponseTimeMs = requestMetrics.GetMaxResponseTime()
+    }
+}));
+
+// Request log endpoint
+app.MapGet("/api/monitor/requests", (int? count) =>
+    Results.Ok(requestMetrics.GetRecentRequests(count ?? 50)));
+
 app.Run();
 
 // --- Models ---
 public record RegistrationRequest(string Name, string Email, string Password, string Institution);
 public record LoginRequest(string Email, string Password);
 public record RegisteredUser(string Name, string Email, string Institution, string PasswordHash, DateTime RegisteredAt);
+
+// --- Monitoring ---
+public class RequestMetrics
+{
+    public DateTime StartTime { get; } = DateTime.UtcNow;
+    public long TotalRequests;
+    public long ClientErrors;
+    public long ServerErrors;
+
+    private readonly ConcurrentQueue<RequestLog> _recentRequests = new();
+    private readonly ConcurrentQueue<long> _responseTimes = new();
+
+    public void TrackRequest(string path, int statusCode, long durationMs)
+    {
+        _recentRequests.Enqueue(new RequestLog(path, statusCode, durationMs, DateTime.UtcNow));
+        _responseTimes.Enqueue(durationMs);
+
+        // Keep only last 200 entries
+        while (_recentRequests.Count > 200) _recentRequests.TryDequeue(out _);
+        while (_responseTimes.Count > 1000) _responseTimes.TryDequeue(out _);
+    }
+
+    public IEnumerable<RequestLog> GetRecentRequests(int count) =>
+        _recentRequests.Reverse().Take(count);
+
+    public double GetAverageResponseTime() =>
+        _responseTimes.IsEmpty ? 0 : Math.Round(_responseTimes.Average(), 1);
+
+    public long GetMaxResponseTime() =>
+        _responseTimes.IsEmpty ? 0 : _responseTimes.Max();
+}
+
+public record RequestLog(string Path, int StatusCode, long DurationMs, DateTime Timestamp);
