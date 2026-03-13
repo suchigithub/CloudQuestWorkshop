@@ -13,6 +13,8 @@ function Login({ user, onLogin }) {
   const [status, setStatus] = useState(null);
   const [message, setMessage] = useState('');
   const [submitting, setSubmitting] = useState(false);
+  const [attemptsRemaining, setAttemptsRemaining] = useState(null);
+  const [lockedUntil, setLockedUntil] = useState(null);
 
   const handleChange = (e) => {
     setForm({ ...form, [e.target.name]: e.target.value });
@@ -35,11 +37,21 @@ function Login({ user, onLogin }) {
       if (res.ok) {
         setStatus('success');
         setMessage(data.message);
+        setAttemptsRemaining(null);
+        setLockedUntil(null);
         onLogin(data.user);
         setForm({ Email: '', Password: '' });
+      } else if (res.status === 423) {
+        setStatus('locked');
+        setMessage(data.error);
+        setLockedUntil(data.lockedUntil);
+        setAttemptsRemaining(0);
       } else {
         setStatus('error');
         setMessage(data.error || 'Login failed. Please try again.');
+        if (data.attemptsRemaining !== undefined) {
+          setAttemptsRemaining(data.attemptsRemaining);
+        }
       }
     } catch {
       setStatus('error');
@@ -121,8 +133,14 @@ function Login({ user, onLogin }) {
 
               {/* Status message */}
               {status && (
-                <div className={`register__status register__status--${status}`}>
-                  {status === 'success' ? '✅' : '❌'} {message}
+                <div className={`register__status register__status--${status === 'locked' ? 'error' : status}`}>
+                  {status === 'success' ? '✅' : status === 'locked' ? '🔒' : '❌'} {message}
+                </div>
+              )}
+
+              {attemptsRemaining !== null && attemptsRemaining > 0 && (
+                <div className="register__status register__status--error">
+                  ⚠️ {attemptsRemaining} attempt{attemptsRemaining !== 1 ? 's' : ''} remaining before account lockout
                 </div>
               )}
 

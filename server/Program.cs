@@ -9,9 +9,12 @@
 
 using System.Collections.Concurrent;
 using System.ComponentModel.DataAnnotations;
+using System.ComponentModel.DataAnnotations.Schema;
 using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.RegularExpressions;
+using Microsoft.EntityFrameworkCore;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -19,6 +22,12 @@ var builder = WebApplication.CreateBuilder(args);
 
 // Application Insights telemetry (auto-detects connection string from Azure)
 builder.Services.AddApplicationInsightsTelemetry();
+
+// Entity Framework Core with SQL Server
+var connectionString = builder.Configuration.GetConnectionString("DefaultConnection") 
+    ?? "Server=(localdb)\\mssqllocaldb;Database=CloudQuestDB;Trusted_Connection=True;";
+builder.Services.AddDbContext<AppDbContext>(options =>
+    options.UseSqlServer(connectionString));
 
 builder.Services.AddCors(options =>
 {
@@ -37,8 +46,14 @@ app.UseCors("AllowReactDev");
 app.UseDefaultFiles();
 app.UseStaticFiles();
 
-// --- In-Memory Stores ---
-var registeredUsers = new ConcurrentDictionary<string, RegisteredUser>(StringComparer.OrdinalIgnoreCase);
+// --- Ensure database is created ---
+using (var scope = app.Services.CreateScope())
+{
+    var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+    db.Database.EnsureCreated();
+}
+
+// --- In-Memory Stores (for metrics only) ---
 var requestMetrics = new RequestMetrics();
 
 // --- Request Logging Middleware ---
@@ -102,8 +117,8 @@ app.MapGet("/api/workshop", () => Results.Ok(new
     }
 }));
 
-// Registration endpoint – stores user with hashed password
-app.MapPost("/api/register", (RegistrationRequest request) =>
+// Registration endpoint – stores user in SQL database
+app.MapPost("/api/register", async (RegistrationRequest request, AppDbContext db) =>
 {
     // Validate required fields
     if (string.IsNullOrWhiteSpace(request.Name) ||
@@ -119,39 +134,55 @@ app.MapPost("/api/register", (RegistrationRequest request) =>
         return Results.BadRequest(new { error = "Invalid email format." });
     }
 
-    if (request.Password.Length < 6)
+    // Strong password validation
+    if (request.Password.Length < 8)
+        return Results.BadRequest(new { error = "Password must be at least 8 characters." });
+    if (!Regex.IsMatch(request.Password, @"[A-Z]"))
+        return Results.BadRequest(new { error = "Password must contain at least one uppercase letter." });
+    if (!Regex.IsMatch(request.Password, @"[a-z]"))
+        return Results.BadRequest(new { error = "Password must contain at least one lowercase letter." });
+    if (!Regex.IsMatch(request.Password, @"[0-9]"))
+        return Results.BadRequest(new { error = "Password must contain at least one number." });
+    if (!Regex.IsMatch(request.Password, @"[^a-zA-Z0-9]"))
+        return Results.BadRequest(new { error = "Password must contain at least one special character." });
+
+    // Check for duplicate email
+    if (await db.Users.AnyAsync(u => u.Email.ToLower() == request.Email.ToLower()))
     {
-        return Results.BadRequest(new { error = "Password must be at least 6 characters." });
+        return Results.BadRequest(new { error = "This email is already registered." });
     }
 
     // Hash the password before storing
     var passwordHash = Convert.ToBase64String(
         SHA256.HashData(Encoding.UTF8.GetBytes(request.Password)));
 
-    var user = new RegisteredUser(
-        request.Name, request.Email, request.Institution,
-        passwordHash, DateTime.UtcNow);
-
-    if (!registeredUsers.TryAdd(request.Email, user))
+    var user = new UserEntity
     {
-        return Results.BadRequest(new { error = "This email is already registered." });
-    }
+        Name = request.Name,
+        Email = request.Email.ToLower(),
+        Institution = request.Institution,
+        PasswordHash = passwordHash,
+        RegisteredAt = DateTime.UtcNow
+    };
+
+    db.Users.Add(user);
+    await db.SaveChangesAsync();
 
     return Results.Ok(new
     {
         message = "Registration successful! You can now log in.",
         registrant = new
         {
-            request.Name,
-            request.Email,
-            request.Institution,
-            registeredAt = DateTime.UtcNow
+            user.Name,
+            user.Email,
+            user.Institution,
+            registeredAt = user.RegisteredAt
         }
     });
 });
 
-// Login endpoint – validates against registered users
-app.MapPost("/api/login", (LoginRequest request) =>
+// Login endpoint – validates against SQL database with account lockout
+app.MapPost("/api/login", async (LoginRequest request, AppDbContext db) =>
 {
     if (string.IsNullOrWhiteSpace(request.Email) ||
         string.IsNullOrWhiteSpace(request.Password))
@@ -159,9 +190,31 @@ app.MapPost("/api/login", (LoginRequest request) =>
         return Results.BadRequest(new { error = "Email and password are required." });
     }
 
-    if (!registeredUsers.TryGetValue(request.Email, out var user))
+    var user = await db.Users.FirstOrDefaultAsync(
+        u => u.Email.ToLower() == request.Email.ToLower());
+
+    if (user == null)
     {
         return Results.Json(new { error = "Invalid email or password." }, statusCode: 401);
+    }
+
+    // Check account lockout (5 failed attempts = 15 min lockout)
+    if (user.LockoutEnd.HasValue && user.LockoutEnd > DateTime.UtcNow)
+    {
+        var minutesLeft = (int)Math.Ceiling((user.LockoutEnd.Value - DateTime.UtcNow).TotalMinutes);
+        return Results.Json(new
+        {
+            error = $"Account locked. Try again in {minutesLeft} minute(s).",
+            lockedUntil = user.LockoutEnd,
+            isLocked = true
+        }, statusCode: 423);
+    }
+
+    // Reset lockout if expired
+    if (user.LockoutEnd.HasValue && user.LockoutEnd <= DateTime.UtcNow)
+    {
+        user.FailedLoginAttempts = 0;
+        user.LockoutEnd = null;
     }
 
     var passwordHash = Convert.ToBase64String(
@@ -169,8 +222,34 @@ app.MapPost("/api/login", (LoginRequest request) =>
 
     if (user.PasswordHash != passwordHash)
     {
-        return Results.Json(new { error = "Invalid email or password." }, statusCode: 401);
+        user.FailedLoginAttempts++;
+        var remaining = 5 - user.FailedLoginAttempts;
+
+        if (user.FailedLoginAttempts >= 5)
+        {
+            user.LockoutEnd = DateTime.UtcNow.AddMinutes(15);
+            await db.SaveChangesAsync();
+            return Results.Json(new
+            {
+                error = "Account locked due to too many failed attempts. Try again in 15 minutes.",
+                isLocked = true,
+                lockedUntil = user.LockoutEnd
+            }, statusCode: 423);
+        }
+
+        await db.SaveChangesAsync();
+        return Results.Json(new
+        {
+            error = "Invalid email or password.",
+            attemptsRemaining = remaining
+        }, statusCode: 401);
     }
+
+    // Successful login – reset failed attempts
+    user.FailedLoginAttempts = 0;
+    user.LockoutEnd = null;
+    user.LastLoginAt = DateTime.UtcNow;
+    await db.SaveChangesAsync();
 
     return Results.Ok(new
     {
@@ -185,7 +264,7 @@ app.MapFallbackToFile("index.html");
 // --- Monitoring Endpoints ---
 
 // Dashboard metrics for the monitoring page
-app.MapGet("/api/monitor", () => Results.Ok(new
+app.MapGet("/api/monitor", (AppDbContext db) => Results.Ok(new
 {
     server = new
     {
@@ -205,9 +284,9 @@ app.MapGet("/api/monitor", () => Results.Ok(new
     },
     registrations = new
     {
-        totalUsers = registeredUsers.Count,
-        institutions = registeredUsers.Values
-            .GroupBy(u => u.Institution, StringComparer.OrdinalIgnoreCase)
+        totalUsers = db.Users.Count(),
+        institutions = db.Users
+            .GroupBy(u => u.Institution)
             .Select(g => new { name = g.Key, count = g.Count() })
             .OrderByDescending(x => x.count)
     },
@@ -228,7 +307,45 @@ app.Run();
 // --- Models ---
 public record RegistrationRequest(string Name, string Email, string Password, string Institution);
 public record LoginRequest(string Email, string Password);
-public record RegisteredUser(string Name, string Email, string Institution, string PasswordHash, DateTime RegisteredAt);
+
+// --- Database Entity ---
+public class UserEntity
+{
+    [Key]
+    public int Id { get; set; }
+    
+    [Required, MaxLength(100)]
+    public string Name { get; set; } = "";
+    
+    [Required, MaxLength(254)]
+    public string Email { get; set; } = "";
+    
+    [Required, MaxLength(200)]
+    public string Institution { get; set; } = "";
+    
+    [Required]
+    public string PasswordHash { get; set; } = "";
+    
+    public DateTime RegisteredAt { get; set; }
+    public DateTime? LastLoginAt { get; set; }
+    public int FailedLoginAttempts { get; set; }
+    public DateTime? LockoutEnd { get; set; }
+}
+
+// --- Database Context ---
+public class AppDbContext : DbContext
+{
+    public AppDbContext(DbContextOptions<AppDbContext> options) : base(options) { }
+    
+    public DbSet<UserEntity> Users => Set<UserEntity>();
+    
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
+    {
+        modelBuilder.Entity<UserEntity>()
+            .HasIndex(u => u.Email)
+            .IsUnique();
+    }
+}
 
 // --- Monitoring ---
 public class RequestMetrics

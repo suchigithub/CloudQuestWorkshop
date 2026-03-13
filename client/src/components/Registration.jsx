@@ -99,9 +99,9 @@ function Registration() {
                   name="Password"
                   value={form.Password}
                   onChange={handleChange}
-                  placeholder="Create a password (min 6 characters)"
+                  placeholder="Create a password (min 8 chars, upper+lower+number+special)"
                   required
-                  minLength={6}
+                  minLength={8}
                   maxLength={100}
                 />
               </div>
